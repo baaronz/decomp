@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include "WoW/Source/Magic/Types.h"
 #include "Unit_C.h"
 #include <cmath>
@@ -19879,6 +19882,232 @@ void NameQueryCallback(int32_t id, const WOWGUID& guid, void* param, bool succes
     }
 }
 
+// ---- Coloured / animated names -------------------------------------------------
+// The server sends colour codes in the player's name and extra settings in the unused
+// "declined names" slots: [0] = "GC:" guild colours, [1] = "AN:" animation ("s,1.5" scroll,
+// "p,1" pulse, speed in cycles per second).
+
+struct NameAnim {
+    char mode;   // 0 = none, 's' = scroll, 'p' = pulse
+    float phase; // 0..1 position in the cycle
+};
+
+static NameAnim GetNameAnim(const char* spec) {
+    NameAnim anim = { 0, 0.0f };
+
+    if (!spec || strncmp(spec, "AN:", 3) || (spec[3] != 's' && spec[3] != 'p')) {
+        return anim;
+    }
+
+    float speed = spec[4] == ',' ? static_cast<float>(atof(spec + 5)) : 1.0f;
+
+    if (speed <= 0.0f || speed > 10.0f) {
+        speed = 1.0f;
+    }
+
+    double cycles = OsGetAsyncTimeMs() * 0.001 * speed;
+    anim.mode = spec[3];
+    anim.phase = static_cast<float>(cycles - floor(cycles));
+    return anim;
+}
+
+static const char* GetNameRecordSlot(const WOWGUID& guid, int32_t slot) {
+    NameCache* rec = g_nameDBCache.GetRecord(guid.m_guid, WOWGUID(), nullptr, nullptr, false);
+
+    if (rec && rec->m_declinedNames) {
+        return rec->m_declinedNames->m_names[slot];
+    }
+
+    return nullptr;
+}
+
+// Colour of a gradient (stops) at t, bouncing back and forth so it never jumps.
+static void SampleStops(const uint8_t (*stops)[3], int32_t count, float t, int32_t* rgb) {
+    float u = t - 2.0f * floorf(t * 0.5f);
+
+    if (u > 1.0f) {
+        u = 2.0f - u;
+    }
+
+    float pos = u * static_cast<float>(count - 1);
+    int32_t seg = static_cast<int32_t>(pos);
+
+    if (count < 2) {
+        seg = 0;
+    } else if (seg > count - 2) {
+        seg = count - 2;
+    }
+
+    float f = count > 1 ? pos - static_cast<float>(seg) : 0.0f;
+    int32_t next = count > 1 ? seg + 1 : seg;
+
+    for (int32_t k = 0; k < 3; k++) {
+        rgb[k] = static_cast<int32_t>(stops[seg][k] + (stops[next][k] - stops[seg][k]) * f + 0.5f);
+    }
+}
+
+static void ApplyPulse(const NameAnim& anim, int32_t* rgb) {
+    if (anim.mode != 'p') {
+        return;
+    }
+
+    float level = 0.55f + 0.45f * (0.5f + 0.5f * sinf(anim.phase * 6.2831853f));
+
+    for (int32_t k = 0; k < 3; k++) {
+        rgb[k] = static_cast<int32_t>(rgb[k] * level);
+    }
+}
+
+// Rewrites every |cffRRGGBB code in `text` in place with the animated colour.
+static void AnimateNameCodes(char* text, const NameAnim& anim) {
+    if (!anim.mode) {
+        return;
+    }
+
+    uint8_t stops[48][3];
+    char* where[48];
+    int32_t count = 0;
+
+    for (char* p = text; *p && count < 48; p++) {
+        unsigned int a, r, g, b;
+
+        if (p[0] == '|' && (p[1] == 'c' || p[1] == 'C') && sscanf(p + 2, "%2x%2x%2x%2x", &a, &r, &g, &b) == 4) {
+            stops[count][0] = static_cast<uint8_t>(r);
+            stops[count][1] = static_cast<uint8_t>(g);
+            stops[count][2] = static_cast<uint8_t>(b);
+            where[count] = p;
+            count++;
+        }
+    }
+
+    if (count < 1) {
+        return;
+    }
+
+    for (int32_t i = 0; i < count; i++) {
+        int32_t rgb[3];
+        float t = count > 1 ? static_cast<float>(i) / static_cast<float>(count - 1) : 0.0f;
+
+        if (anim.mode == 's') {
+            t += anim.phase * 2.0f;
+        }
+
+        SampleStops(stops, count, t, rgb);
+        ApplyPulse(anim, rgb);
+
+        char hex[16];
+        SStrPrintf(hex, sizeof(hex), "%02x%02x%02x", rgb[0], rgb[1], rgb[2]);
+        memcpy(where[i] + 4, hex, 6);
+    }
+}
+
+// Colours the guild text "<Guild>" (brackets included). Colours come from the server
+// ("GC:" list), else from the player's name. Leaves it plain if it has its own codes.
+static void ColorGuildText(const char* name, const char* guildSpec, const NameAnim& anim, const char* text, char* out, size_t size) {
+    SStrCopy(out, text, size);
+
+    if (strchr(text, '|')) {
+        return;
+    }
+
+    uint8_t cols[48][3];
+    int32_t count = 0;
+
+    // "GC:" + hex list, "GC:-" = plain, "GC:" = follow the name.
+    if (guildSpec && !strncmp(guildSpec, "GC:", 3)) {
+        const char* g = guildSpec + 3;
+
+        if (*g == '-') {
+            return;
+        }
+
+        while (*g && count < 48) {
+            unsigned int r, gr, b;
+
+            if (sscanf(g, "%2x%2x%2x", &r, &gr, &b) != 3) {
+                break;
+            }
+
+            cols[count][0] = static_cast<uint8_t>(r);
+            cols[count][1] = static_cast<uint8_t>(gr);
+            cols[count][2] = static_cast<uint8_t>(b);
+            count++;
+            g += 6;
+
+            if (*g != ',') {
+                break;
+            }
+
+            g++;
+        }
+    }
+
+    if (!count && name) {
+        for (const char* p = name; *p && count < 48; p++) {
+            unsigned int a, r, g, b;
+
+            if (p[0] == '|' && (p[1] == 'c' || p[1] == 'C') && sscanf(p + 2, "%2x%2x%2x%2x", &a, &r, &g, &b) == 4) {
+                cols[count][0] = static_cast<uint8_t>(r);
+                cols[count][1] = static_cast<uint8_t>(g);
+                cols[count][2] = static_cast<uint8_t>(b);
+                count++;
+            }
+        }
+    }
+
+    if (!count) {
+        return;
+    }
+
+    // Split into UTF-8 characters.
+    int32_t starts[64];
+    int32_t n = 0;
+    size_t len = strlen(text);
+
+    for (size_t i = 0; i < len && n < 63;) {
+        starts[n++] = static_cast<int32_t>(i);
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        i += (c & 0x80) == 0 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4;
+    }
+
+    starts[n] = static_cast<int32_t>(len);
+
+    // Per-letter codes need 10 bytes per letter plus the text; stay plain if too long.
+    if (!n || len + 10 * n + 2 >= size) {
+        return;
+    }
+
+    char* dst = out;
+    char* end = out + size;
+
+    for (int32_t i = 0; i < n; i++) {
+        float t = n > 1 ? static_cast<float>(i) / static_cast<float>(n - 1) : 0.0f;
+
+        if (anim.mode == 's') {
+            t += anim.phase * 2.0f;
+        }
+
+        int32_t rgb[3];
+        SampleStops(cols, count, t, rgb);
+        ApplyPulse(anim, rgb);
+
+        dst += SStrPrintf(dst, static_cast<uint32_t>(end - dst), "|cff%02x%02x%02x", rgb[0], rgb[1], rgb[2]);
+        int32_t charLen = starts[i + 1] - starts[i];
+        memcpy(dst, text + starts[i], charLen);
+        dst += charLen;
+    }
+
+    *dst = '\0';
+    SStrPrintf(dst, static_cast<uint32_t>(end - dst), "|r");
+}
+
+// Speed of the name animation of a unit, 0 if it is not animated (used by the name renderer).
+int32_t UnitNameIsAnimated(const WOWGUID& guid) {
+    const char* spec = GetNameRecordSlot(guid, 1);
+    return spec && !strncmp(spec, "AN:", 3) && (spec[3] == 's' || spec[3] == 'p');
+}
+
+
 // VERIFY: 0cbc8a3a manual
 // OFFSET: 0x0072D4F0
 int32_t CGUnit_C::UpdateObjectNameStringForUnit(CGUnit_C* unit, int32_t flags, char* buffer, uint32_t size, uint32_t a5) {
@@ -19916,7 +20145,7 @@ int32_t CGUnit_C::UpdateObjectNameStringForUnit(CGUnit_C* unit, int32_t flags, c
     unit->GetDevText(devText, sizeof(devText));
 
     char titleText[1024] = {};
-    char guildText[100] = {};
+    char guildText[640] = {};
     char subNameText[1024] = {};
     char summonedText[1024] = {};
     char foreignText[8] = {};
@@ -19925,11 +20154,21 @@ int32_t CGUnit_C::UpdateObjectNameStringForUnit(CGUnit_C* unit, int32_t flags, c
     unit->GetUnitChosenTitle(titleText, sizeof(titleText), (flags & 8) != 0, &lines);
 
     if (unit->m_obj->m_type & TYPE_PLAYER) {
+        AnimateNameCodes(titleText, GetNameAnim(GetNameRecordSlot(unit->m_obj->m_guid, 1)));
+    }
+
+    if (unit->m_obj->m_type & TYPE_PLAYER) {
         if (flags & 4) {
             const char* guildName = static_cast<CGPlayer_C*>(unit)->GetPlayerGuildNameText();
 
             if (guildName && *guildName) {
-                SStrPrintf(guildText, sizeof(guildText), "\n<%s>", guildName);
+                char plainGuild[128];
+                char coloredGuild[600];
+                SStrPrintf(plainGuild, sizeof(plainGuild), "<%s>", guildName);
+                const char* guildSpec = GetNameRecordSlot(unit->m_obj->m_guid, 0);
+                NameAnim anim = GetNameAnim(GetNameRecordSlot(unit->m_obj->m_guid, 1));
+                ColorGuildText(unit->GetUnitName(nullptr, 1), guildSpec, anim, plainGuild, coloredGuild, sizeof(coloredGuild));
+                SStrPrintf(guildText, sizeof(guildText), "\n%s", coloredGuild);
                 lines++;
             }
         }

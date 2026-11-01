@@ -1,4 +1,9 @@
+#include <cstdio>
+#include <cstring>
 #include "PlayerName.h"
+#include "Engine/Source/Os/TimeManager.h"
+
+int32_t UnitNameIsAnimated(const WOWGUID& guid);
 #include <typeinfo>
 #include "Engine/Source/Base/CDataAllocator.h"
 #include "Engine/Source/Base/Handle.h"
@@ -350,6 +355,16 @@ void PLAYERNAMEDESC::Render() {
             }
         }
 
+        // Animated names: rebuild the text about 10 times a second.
+        if (this->m_string && !(this->m_flags & 0x1) && UnitNameIsAnimated(this->m_guid)) {
+            uint32_t now = OsGetAsyncTimeMs();
+
+            if (now - this->unused_0034 >= 100) {
+                this->unused_0034 = now;
+                this->m_flags |= 0x1;
+            }
+        }
+
         if (this->m_string && (this->m_flags & 0x1)) {
             GxuFontDestroyString(this->m_string);
             this->m_zOffset = 0.0f;
@@ -359,11 +374,12 @@ void PLAYERNAMEDESC::Render() {
         if (!this->m_string) {
             char text[1024] = {};
             int32_t lines = object->UpdateObjectNameString(s_nameMask, text, sizeof(text));
+
             this->m_zOffset = lines * lineHeight;
 
             if (s_playerNameFont && text[0]) {
                 C3Vector origin(0.0f, 0.0f, 1.0f);
-                GxuFontCreateString(s_playerNameFont, LanguageProcess(text), lineHeight, origin, 100000.0f, 100000.0f, 0.0f, this->m_string, GxVJ_Bottom, GxHJ_Center, 200, this->m_color, 0.0f, 1.0f);
+                GxuFontCreateString(s_playerNameFont, LanguageProcess(text), lineHeight, origin, 100000.0f, 100000.0f, 0.0f, this->m_string, GxVJ_Bottom, GxHJ_Center, 192, this->m_color, 0.0f, 1.0f);
             }
 
             this->m_flags &= ~0x1;

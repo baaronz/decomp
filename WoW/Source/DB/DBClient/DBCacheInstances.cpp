@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstring>
 #include "DBCacheInstances.h"
 #include <cstring>
 #include "Engine/Source/Base/CDataStore.h"
@@ -303,6 +305,10 @@ static int32_t ReceiveName(void* param, NETMESSAGE msgId, uint32_t time, CDataSt
             }
 
             g_nameDBCache.AddItem(&name, name.m_guid.m_guid);
+
+            // Rebuild the floating name now (server may send a changed name unasked).
+            CGGameUI::UnitNameUpdate(name.m_guid);
+
 
             if ((name.m_guid.m_guid & 0xF000000000000000ULL) == 0x1000000000000000ULL && (name.m_guid.m_guid & 0x0FF0000000000000ULL) == 0x0FD0000000000000ULL) {
                 g_nameDBCache.SetTemporary(name.m_guid.m_guid);
