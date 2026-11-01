@@ -16,6 +16,9 @@
 #include "WoW/Source/WowSvcs/WowSvcsClient/ClientServices.h"
 #include "GameVersion.h"
 
+class NameCache;
+void NameCacheReceived(uint64_t guid);
+
 class CHashKeyGUID;
 class CWardenKey;
 
@@ -563,6 +566,11 @@ void DBCache<T, TKey, THashKey>::AddItems(CDataStore* msg, bool single) {
 
             if (invalidate) {
                 this->Invalidate(key);
+            }
+
+            // Name changed on an already cached unit: rebuild its floating name now.
+            if constexpr (std::is_same_v<T, NameCache>) {
+                NameCacheReceived(static_cast<uint64_t>(key));
             }
         }
     } while (--count);

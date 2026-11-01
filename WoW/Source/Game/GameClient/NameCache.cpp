@@ -1,6 +1,7 @@
 #include "NameCache.h"
 #include "Engine/Source/Base/CDataStore.h"
 #include "Engine/Source/Storm/H/storm.h"
+#include "WoW/Source/Ui/GameUI.h"
 
 // INLINED
 NameCache::NameCache() {
@@ -82,4 +83,10 @@ void NameCache::Unpack(CDataStore* msg) {
     msg->Get(this->m_race);
     msg->Get(this->m_sex);
     msg->Get(this->m_class);
+}
+
+// Called when a name query response arrives, including ones the server sends unasked.
+void NameCacheReceived(uint64_t guid) {
+    WOWGUID wowGuid = { guid };
+    CGGameUI::UnitNameUpdate(wowGuid);
 }
